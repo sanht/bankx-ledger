@@ -1,0 +1,40 @@
+# Gradle
+.gradle/
+build/
+out/
+*.class
+
+# IDE
+.idea/
+*.iml
+*.iws
+*.ipr
+.vscode/
+.DS_Store
+
+# Maven
+target/
+pom.xml.tag
+pom.xml.releaseBackup
+
+# Logs
+*.log
+logs/
+
+# Runtime
+*.jar
+!gradle/wrapper/gradle-wrapper.jar
+*.war
+*.ear
+
+# Database
+*.h2.db
+*.db
+
+# Environment
+.env
+.env.local
+
+# OS
+Thumbs.db
+.DS_Store

@@ -1,0 +1,8 @@
+# Cluster local: expone el NodePort 30080 del Service en localhost:8081
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+nodes:
+  - role: control-plane
+    extraPortMappings:
+      - containerPort: 30080
+        hostPort: 8081
