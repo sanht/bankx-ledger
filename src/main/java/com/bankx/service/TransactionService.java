@@ -3,13 +3,18 @@ package com.bankx.service;
 import com.bankx.domain.Account;
 import com.bankx.domain.Transaction;
 import com.bankx.dto.ErrorResponse;
+import com.bankx.dto.RiskDecision;
 import com.bankx.dto.TransactionRequest;
 import com.bankx.dto.TransactionResponse;
-import com.bankx.exception.BusinessException;
+import com.bankx.exception.AccountNotFoundException;
+import com.bankx.exception.InsufficientFundsException;
+import com.bankx.exception.RiskRejectedException;
 import com.bankx.repository.AccountRepository;
 import com.bankx.repository.TransactionRepository;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
+import org.springframework.util.StringUtils;
+import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 import reactor.util.context.Context;
 
@@ -24,20 +29,23 @@ public class TransactionService {
     private final AccountRepository accountRepository;
     private final TransactionRepository transactionRepository;
     private final RiskService riskService;
+    private final TransactionEventPublisher eventPublisher;
 
     public TransactionService(AccountRepository accountRepository,
                             TransactionRepository transactionRepository,
-                            RiskService riskService) {
+                            RiskService riskService,
+                            TransactionEventPublisher eventPublisher) {
         this.accountRepository = accountRepository;
         this.transactionRepository = transactionRepository;
         this.riskService = riskService;
+        this.eventPublisher = eventPublisher;
     }
 
     /**
      * Procesa una transacción: valida, evalúa riesgo, actualiza saldo.
      * Retorna Mono<TransactionResponse> o error.
      */
-    public Mono<TransactionResponse> processTransaction(TransactionRequest request) {
+    public Mono<TransactionResponse> procesarTransaccion(TransactionRequest request) {
         
         return Mono.deferContextual(ctx -> {
             String correlationId = ctx.get("correlationId");
@@ -46,9 +54,9 @@ public class TransactionService {
             log.info("[{}] Processing {} transaction for account {} amount {}", 
                 correlationId, request.getType(), request.getAccountNumber(), request.getAmount());
             
-            return validateAccount(request.getAccountNumber(), correlationId)
-                .flatMap(account -> evaluateRisk(account, request, correlationId))
-                .flatMap(riskDecision -> processWithRisk(request, riskDecision, correlationId, transactionId))
+            return validarCuenta(request.getAccountNumber(), correlationId)
+                .flatMap(account -> evaluarRiesgo(account, request, correlationId))
+                .flatMap(riskDecision -> procesarConRiesgo(request, riskDecision, correlationId, transactionId))
                 .doOnSuccess(response -> {
                     log.info("[{}] Transaction {} completed successfully", correlationId, transactionId);
                 })
@@ -61,11 +69,9 @@ public class TransactionService {
     /**
      * Valida que la cuenta exista.
      */
-    private Mono<Account> validateAccount(String accountNumber, String correlationId) {
+    private Mono<Account> validarCuenta(String accountNumber, String correlationId) {
         return accountRepository.findByAccountNumber(accountNumber)
-            .switchIfEmpty(Mono.error(
-                new RuntimeException("account_not_found")
-            ))
+            .switchIfEmpty(Mono.error(new AccountNotFoundException()))
             .doOnError(error -> {
                 log.warn("[{}] Account validation failed: {}", correlationId, error.getMessage());
             });
@@ -75,10 +81,10 @@ public class TransactionService {
      * Evalúa riesgo a través del servicio remoto.
      * Propaga correlationId en el contexto.
      */
-    private Mono<RiskService.RiskDecision> evaluateRisk(Account account, 
+    private Mono<RiskDecision> evaluarRiesgo(Account account, 
                                                          TransactionRequest request,
                                                          String correlationId) {
-        return riskService.evaluateRisk(
+        return riskService.evaluarRiesgo(
             account.getAccountNumber(),
             request.getAmount(),
             correlationId,
@@ -86,7 +92,7 @@ public class TransactionService {
         )
         .onErrorResume(error -> {
             log.warn("[{}] Risk evaluation error, will be handled in processing", correlationId);
-            return Mono.just(RiskService.RiskDecision.builder()
+            return Mono.just(RiskDecision.builder()
                 .decision("ERROR")
                 .reason(error.getMessage())
                 .build());
@@ -96,15 +102,15 @@ public class TransactionService {
     /**
      * Procesa la transacción si el riesgo es aceptable.
      */
-    private Mono<TransactionResponse> processWithRisk(TransactionRequest request,
-                                                      RiskService.RiskDecision riskDecision,
-                                                      String correlationId,
-                                                      String transactionId) {
+    private Mono<TransactionResponse> procesarConRiesgo(TransactionRequest request,
+                                                        RiskDecision riskDecision,
+                                                        String correlationId,
+                                                        String transactionId) {
         
         // Verificar decisión de riesgo
         if (!"OK".equals(riskDecision.getDecision())) {
             log.warn("[{}] Risk rejected: {}", correlationId, riskDecision.getReason());
-            return Mono.error(new RuntimeException("risk_rejected"));
+            return Mono.error(new RiskRejectedException());
         }
 
         // Obtener cuenta y validar fondos
@@ -118,7 +124,7 @@ public class TransactionService {
                     log.warn("[{}] Insufficient funds. Balance: {}, Requested: {}", 
                         correlationId, account.getBalance(), request.getAmount());
                     
-                    return Mono.error(new RuntimeException("insufficient_funds"));
+                    return Mono.error(new InsufficientFundsException());
                 }
 
                 // Actualizar saldo
@@ -146,7 +152,8 @@ public class TransactionService {
                             .build();
                         
                         return transactionRepository.save(transaction)
-                            .map(saved -> toResponse(saved, updatedAccount));
+                            .<TransactionResponse>map(saved -> aRespuesta(saved, updatedAccount))
+                            .doOnNext(eventPublisher::publicar);
                     });
             });
     }
@@ -154,7 +161,7 @@ public class TransactionService {
     /**
      * Convierte Transaction + Account actualizada a TransactionResponse.
      */
-    private TransactionResponse toResponse(Transaction transaction, Account account) {
+    private TransactionResponse aRespuesta(Transaction transaction, Account account) {
         return TransactionResponse.builder()
             .transactionId(transaction.getId())
             .accountNumber(transaction.getAccountNumber())
@@ -169,12 +176,36 @@ public class TransactionService {
     }
 
     /**
-     * Retorna transacciones para una cuenta.
+     * Stream SSE: historial de la cuenta (si se indica) seguido de las transacciones
+     * que se confirmen mientras el cliente siga conectado.
+     * merge suscribe ambos a la vez para no perder eventos emitidos mientras se lee el historial.
      */
-    public reactor.core.publisher.Flux<Transaction> getTransactionsByAccount(String accountNumber) {
-        return transactionRepository.findByAccountNumber(accountNumber)
-            .doOnError(error -> {
-                log.error("Error fetching transactions for account {}: {}", accountNumber, error.getMessage());
-            });
+    public Flux<TransactionResponse> transmitirTransacciones(String accountNumber) {
+        if (!StringUtils.hasText(accountNumber)) {
+            return eventPublisher.eventos();
+        }
+
+        Flux<TransactionResponse> historial = transactionRepository.findByAccountNumber(accountNumber)
+            .map(this::aRespuestaHistorial)
+            .doOnError(error ->
+                log.error("Error fetching transactions for account {}: {}", accountNumber, error.getMessage()));
+
+        Flux<TransactionResponse> enVivo = eventPublisher.eventos()
+            .filter(event -> accountNumber.equals(event.getAccountNumber()));
+
+        return Flux.merge(historial, enVivo);
+    }
+
+    private TransactionResponse aRespuestaHistorial(Transaction transaction) {
+        return TransactionResponse.builder()
+            .transactionId(transaction.getId())
+            .accountNumber(transaction.getAccountNumber())
+            .type(transaction.getType())
+            .amount(transaction.getAmount())
+            .status(transaction.getStatus())
+            .createdAt(transaction.getCreatedAt())
+            .correlationId(transaction.getCorrelationId())
+            .usedFallback(transaction.isUsedFallback())
+            .build();
     }
 }

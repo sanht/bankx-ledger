@@ -42,10 +42,12 @@ docker --version       # Docker
 cd bankx-ledger
 ```
 
-2. **Levantar MongoDB y H2**
+2. **Levantar MongoDB y el mock del servicio de riesgo** (H2 corre embebido en la app)
 ```bash
 docker-compose up -d
 ```
+El mock (WireMock, puerto 9090) responde según el campo `simulate` del request:
+`fail`, `flaky`, `invalid`, `timeout`. Ver `docs-local/RESILIENCIA_OBSERVABILIDAD.md`.
 
 3. **Compilar**
 ```bash
@@ -113,6 +115,14 @@ curl -X POST http://localhost:8080/api/transactions \
 curl -N http://localhost:8080/api/stream/transactions?accountNumber=001-0001
 ```
 
+Con `accountNumber` emite primero el historial de la cuenta y luego, en vivo, cada transacción
+confirmada de esa cuenta. Sin `accountNumber` emite en vivo las transacciones de todas las cuentas.
+El stream no termina: queda abierto hasta que el cliente se desconecta.
+
+Mientras no haya transacciones, el servidor envía un comentario `:heartbeat` cada 15 s
+(`bankx.sse.heartbeat-interval`) para que ingress-nginx o APIM no cierren la conexión por
+inactividad. Los clientes `EventSource` ignoran los comentarios.
+
 **Response (event stream)**
 ```
 event: transaction
@@ -145,12 +155,12 @@ WebFlux permite:
 
 **Mono** para una respuesta única:
 ```java
-public Mono<TransactionResponse> processTransaction(TransactionRequest request)
+public Mono<TransactionResponse> procesarTransaccion(TransactionRequest request)
 ```
 
 **Flux** para streams:
 ```java
-public Flux<Transaction> getTransactionsByAccount(String accountNumber)
+public Flux<TransactionResponse> transmitirTransacciones(String accountNumber)
 ```
 
 ### 2. **¿Dónde está el bloqueo? ¿Cómo lo aislaste?**
@@ -161,8 +171,8 @@ public Flux<Transaction> getTransactionsByAccount(String accountNumber)
 
 **Aislamiento:**
 ```java
-// En RiskService.fallbackRiskEvaluation()
-return Mono.fromCallable(() -> legacyService.evaluateRiskLegacy(...))
+// En RiskService.respaldoEvaluacionRiesgo()
+return Mono.fromCallable(() -> legacyService.evaluarRiesgoLegado(...))
     .subscribeOn(Schedulers.boundedElastic())  // ← Thread pool aislado
 ```
 
@@ -173,44 +183,33 @@ return Mono.fromCallable(() -> legacyService.evaluateRiskLegacy(...))
 
 ### 3. **Resiliencia: Circuit Breaker + Retry + TimeLimiter**
 
-```yaml
-resilience4j:
-  circuitbreaker:
-    risk-service:
-      failure-rate-threshold: 50%
-      wait-duration-in-open-state: 10s
-  
-  retry:
-    risk-service:
-      max-attempts: 3
-  
-  timelimiter:
-    risk-service:
-      timeout: 5s
+Composición explícita en `RiskService` (el orden importa):
+
+```java
+llamarServicioRemoto(...)
+    .transformDeferred(TimeLimiterOperator.of(timeLimiter))        // corta cada intento a los 5 s
+    .transformDeferred(CircuitBreakerOperator.of(circuitBreaker))  // registra cada intento; en OPEN ni llama
+    .transformDeferred(RetryOperator.of(retry))                    // reintenta solo errores pasajeros
+    .onErrorResume(error -> respaldoEvaluacionRiesgo(...));        // legado, afuera de todo
 ```
 
 **Flujo:**
-1. Intenta evaluar riesgo remoto
-2. Si timeout > 5s → cancela
-3. Si falla 50% de intentos → Circuit OPEN
-4. Circuit OPEN → fallback a legacy inmediato
-5. Retry 3 veces con backoff
+1. Intenta evaluar riesgo remoto; cada intento tiene 5 s como máximo
+2. Conexión fallida o 502/503/504 → reintenta hasta 3 intentos, con 500 ms entre ellos
+3. Timeout o 4xx → no reintenta
+4. 50% de fallos en los últimos 10 intentos → Circuit OPEN (los 4xx no cuentan)
+5. Circuit OPEN → fallback a legacy inmediato, sin llamar al remoto
+6. A los 10 s → HALF_OPEN: 3 llamadas de prueba deciden si vuelve a CLOSED u OPEN
+
+Detalle y mediciones: `docs-local/RESILIENCIA_OBSERVABILIDAD.md`. Escenarios: `scripts/escenarios.sh` (curl) y `postman/BankX-Ledger.postman_collection.json` (Postman).
 
 ### 4. **Correlación X-Correlation-Id**
 
-```java
-// Controller: extrae o genera
-String correlationId = exchange.getRequest()
-    .getHeaders()
-    .getFirst("X-Correlation-Id") 
-    ?? UUID.randomUUID();
-
-// MDC: propaga en logs
-MDC.put("correlationId", correlationId);
-
-// Reactor Context: propaga en cadena reactiva
-.contextWrite(Context.of("correlationId", correlationId))
-```
+- `CorrelationIdFilter` (WebFilter): toma el header o genera un UUID, lo devuelve en la respuesta
+  y lo guarda en el contexto de Reactor con `contextWrite`.
+- `context-propagation` + `spring.reactor.context-propagation: auto`: Reactor copia el valor al MDC
+  en cada cambio de hilo, así que todos los logs JSON lo incluyen.
+- `RiskService` lo reenvía al servicio de riesgo en el header `X-Correlation-Id`.
 
 **En logs:**
 ```
@@ -266,10 +265,10 @@ gradle jacocoTestCoverageVerification
 > "Event-loop se bloquea en cada query SQL. Con 100 requests concurrentes, queuean esperando a que termine cada query. Con boundedElastic, cada request va a thread pool separado."
 
 ### Pregunta 2: "¿Cómo se propaga X-Correlation-Id?"
-> "MDC.put() en controller, Reactor Context en cadena reactiva. Logs JSON incluyen correlationId. Puedo rastrear 1 request por todo el flujo."
+> "Un WebFilter lo guarda en el contexto de Reactor, que viaja con la petición. Como el MDC es por hilo y WebFlux cambia de hilo, uso context-propagation para que Reactor lo copie al MDC en cada cambio. Medido: una transacción pasa por 4 hilos y todas sus líneas de log tienen el mismo correlationId."
 
 ### Pregunta 3: "¿Qué falla primero si risk-service es lento?"
-> "TimeLimiter (5s) → si no responde, cancela. Retry 3x si timeout. Si 50% fallan → Circuit OPEN. Luego fallback a legacy en boundedElastic."
+> "Con el circuito CLOSED, el TimeLimiter: espera 5 s, cancela y responde el legado en boundedElastic (5.12 s medidos). Los timeouts no se reintentan, porque reintentar a un servicio lento suma carga y llevaría la espera a 15 s. Cada timeout cuenta como fallo; al llegar al 50% el circuito se abre y desde ahí la respuesta baja a 0.12 s, porque ya no se llama al remoto."
 
 ### Pregunta 4: "¿Cómo evitas desplegar imagen distinta a validada?"
 > "CI/CD hashea imagen antes de push. Deploy compara hash. Si no coincide, rechaza."

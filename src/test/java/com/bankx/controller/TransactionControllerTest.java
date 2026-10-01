@@ -1,13 +1,18 @@
 package com.bankx.controller;
 
-import com.bankx.domain.Transaction;
 import com.bankx.dto.TransactionRequest;
 import com.bankx.dto.TransactionResponse;
+import com.bankx.exception.AccountNotFoundException;
+import com.bankx.exception.InsufficientFundsException;
+import com.bankx.exception.RiskRejectedException;
+import com.bankx.exception.ValidationException;
 import com.bankx.service.TransactionService;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.autoconfigure.web.reactive.WebFluxTest;
+import org.springframework.core.ParameterizedTypeReference;
 import org.springframework.http.MediaType;
+import org.springframework.http.codec.ServerSentEvent;
 import org.springframework.test.context.bean.override.mockito.MockitoBean;
 import org.springframework.test.web.reactive.server.WebTestClient;
 import reactor.core.publisher.Flux;
@@ -15,6 +20,7 @@ import reactor.core.publisher.Mono;
 import reactor.test.StepVerifier;
 
 import java.math.BigDecimal;
+import java.time.Duration;
 import java.util.Map;
 
 import static org.mockito.ArgumentMatchers.any;
@@ -22,8 +28,12 @@ import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
-@WebFluxTest(TransactionController.class)
+@WebFluxTest(controllers = TransactionController.class,
+    properties = "bankx.sse.heartbeat-interval=100ms")
 class TransactionControllerTest {
+
+    private static final ParameterizedTypeReference<ServerSentEvent<TransactionResponse>> SSE_TYPE =
+        new ParameterizedTypeReference<>() { };
 
     private static final Map<String, Object> VALID_REQUEST = Map.of(
         "accountNumber", "001-0001",
@@ -48,7 +58,7 @@ class TransactionControllerTest {
 
     @Test
     void createTransactionReturnsOkWithResponse() {
-        when(transactionService.processTransaction(any(TransactionRequest.class)))
+        when(transactionService.procesarTransaccion(any(TransactionRequest.class)))
             .thenReturn(Mono.just(TransactionResponse.builder()
                 .transactionId("tx-1")
                 .accountNumber("001-0001")
@@ -69,7 +79,7 @@ class TransactionControllerTest {
 
     @Test
     void createTransactionPropagatesCorrelationIdToReactorContext() {
-        when(transactionService.processTransaction(any(TransactionRequest.class)))
+        when(transactionService.procesarTransaccion(any(TransactionRequest.class)))
             .thenReturn(Mono.deferContextual(ctx -> Mono.just(TransactionResponse.builder()
                 .correlationId(ctx.get("correlationId"))
                 .build())));
@@ -82,8 +92,8 @@ class TransactionControllerTest {
 
     @Test
     void createTransactionGeneratesCorrelationIdWhenHeaderIsMissing() {
-        when(transactionService.processTransaction(any(TransactionRequest.class)))
-            .thenReturn(Mono.error(new RuntimeException("account_not_found")));
+        when(transactionService.procesarTransaccion(any(TransactionRequest.class)))
+            .thenReturn(Mono.error(new AccountNotFoundException()));
 
         postTransaction(VALID_REQUEST, null)
             .expectStatus().isEqualTo(422)
@@ -93,32 +103,37 @@ class TransactionControllerTest {
 
     @Test
     void accountNotFoundMapsTo422() {
-        assertBusinessError("account_not_found", 422, "account_not_found", "Account not found");
+        assertBusinessError(new AccountNotFoundException(), 422, "account_not_found", "Account not found");
     }
 
     @Test
     void insufficientFundsMapsTo422() {
-        assertBusinessError("insufficient_funds", 422, "insufficient_funds", "Insufficient funds");
+        assertBusinessError(new InsufficientFundsException(), 422, "insufficient_funds", "Insufficient funds");
     }
 
     @Test
     void riskRejectedMapsTo422() {
-        assertBusinessError("risk_rejected", 422, "risk_rejected", "Risk service rejected the transaction");
+        assertBusinessError(new RiskRejectedException(), 422, "risk_rejected", "Risk service rejected the transaction");
     }
 
     @Test
     void validationErrorMapsTo400() {
-        assertBusinessError("validation failed: amount", 400, "validation_error", "validation failed: amount");
+        assertBusinessError(new ValidationException("validation failed: amount"), 400, "validation_error", "validation failed: amount");
+    }
+
+    @Test
+    void messageMentioningBusinessCodeIsNotTreatedAsBusinessError() {
+        assertBusinessError(new RuntimeException("insufficient_funds"), 500, "internal_error", "insufficient_funds");
     }
 
     @Test
     void unexpectedErrorMapsTo500() {
-        assertBusinessError("boom", 500, "internal_error", "boom");
+        assertBusinessError(new RuntimeException("boom"), 500, "internal_error", "boom");
     }
 
     @Test
     void errorWithoutMessageMapsTo500() {
-        when(transactionService.processTransaction(any(TransactionRequest.class)))
+        when(transactionService.procesarTransaccion(any(TransactionRequest.class)))
             .thenReturn(Mono.error(new RuntimeException()));
 
         postTransaction(VALID_REQUEST, "corr-null")
@@ -130,47 +145,142 @@ class TransactionControllerTest {
     @Test
     void invalidRequestIsRejectedBeforeReachingTheService() {
         postTransaction(Map.of("accountNumber", "", "type", "DEBIT", "amount", -5), "corr-invalid")
-            .expectStatus().isBadRequest();
+            .expectStatus().isBadRequest()
+            .expectBody()
+            .jsonPath("$.error").isEqualTo("validation_error")
+            .jsonPath("$.correlationId").isEqualTo("corr-invalid");
 
-        verify(transactionService, never()).processTransaction(any());
+        verify(transactionService, never()).procesarTransaccion(any());
     }
 
     @Test
-    void streamTransactionsReturnsAccountTransactions() {
-        when(transactionService.getTransactionsByAccount("001-0001"))
-            .thenReturn(Flux.just(
-                Transaction.builder().id("tx-1").accountNumber("001-0001").type("DEBIT")
-                    .amount(BigDecimal.TEN).status("OK").build(),
-                Transaction.builder().id("tx-2").accountNumber("001-0001").type("CREDIT")
-                    .amount(BigDecimal.ONE).status("OK").build()));
+    void unknownTransactionTypeIsRejectedAsValidationError() {
+        postTransaction(Map.of("accountNumber", "001-0001", "type", "TRANSFER", "amount", 10), "corr-type")
+            .expectStatus().isBadRequest()
+            .expectBody()
+            .jsonPath("$.error").isEqualTo("validation_error")
+            .jsonPath("$.message").value(message -> org.assertj.core.api.Assertions.assertThat((String) message).contains("type"));
 
-        Flux<TransactionResponse> body = webTestClient.get()
+        verify(transactionService, never()).procesarTransaccion(any());
+    }
+
+    @Test
+    void malformedJsonIsRejectedAsValidationError() {
+        webTestClient.post()
+            .uri("/api/transactions")
+            .contentType(MediaType.APPLICATION_JSON)
+            .bodyValue("{ not json")
+            .exchange()
+            .expectStatus().isBadRequest()
+            .expectBody()
+            .jsonPath("$.error").isEqualTo("validation_error")
+            .jsonPath("$.correlationId").isNotEmpty();
+
+        verify(transactionService, never()).procesarTransaccion(any());
+    }
+
+    @Test
+    void streamTransactionsEmitsNamedSseEvents() {
+        when(transactionService.transmitirTransacciones("001-0001"))
+            .thenReturn(Flux.just(
+                TransactionResponse.builder().transactionId("tx-1").accountNumber("001-0001")
+                    .type("DEBIT").amount(BigDecimal.TEN).status("OK").build(),
+                TransactionResponse.builder().transactionId("tx-2").accountNumber("001-0001")
+                    .type("CREDIT").amount(BigDecimal.ONE).status("OK").build()));
+
+        Flux<ServerSentEvent<TransactionResponse>> body = webTestClient.get()
             .uri("/api/stream/transactions?accountNumber=001-0001")
-            .header("X-Correlation-Id", "corr-stream")
             .accept(MediaType.TEXT_EVENT_STREAM)
             .exchange()
             .expectStatus().isOk()
-            .returnResult(TransactionResponse.class)
+            .returnResult(SSE_TYPE)
             .getResponseBody();
 
         StepVerifier.create(body)
-            .expectNextMatches(tx -> "tx-1".equals(tx.getTransactionId()) && "corr-stream".equals(tx.getCorrelationId()))
-            .expectNextMatches(tx -> "tx-2".equals(tx.getTransactionId()))
+            .expectNextMatches(event -> "transaction".equals(event.event())
+                && "tx-1".equals(event.id())
+                && "DEBIT".equals(event.data().getType()))
+            .expectNextMatches(event -> "tx-2".equals(event.data().getTransactionId()))
             .verifyComplete();
     }
 
     @Test
-    void streamTransactionsWithoutAccountIsEmpty() {
-        Flux<TransactionResponse> body = webTestClient.get()
+    void streamSendsHeartbeatCommentsWhileThereAreNoTransactions() {
+        when(transactionService.transmitirTransacciones(null)).thenReturn(Flux.never());
+
+        Flux<ServerSentEvent<TransactionResponse>> body = webTestClient.get()
             .uri("/api/stream/transactions")
             .accept(MediaType.TEXT_EVENT_STREAM)
             .exchange()
             .expectStatus().isOk()
-            .returnResult(TransactionResponse.class)
+            .returnResult(SSE_TYPE)
+            .getResponseBody();
+
+        StepVerifier.create(body)
+            .expectNextMatches(event -> "heartbeat".equals(event.comment()) && event.data() == null)
+            .expectNextMatches(event -> "heartbeat".equals(event.comment()))
+            .thenCancel()
+            .verify(Duration.ofSeconds(5));
+    }
+
+    @Test
+    void streamClosesWhenTransactionStreamFailsAfterHeartbeats() {
+        when(transactionService.transmitirTransacciones("001-0001"))
+            .thenReturn(Flux.<TransactionResponse>error(new RuntimeException("mongo down"))
+                .delaySubscription(Duration.ofMillis(350)));
+
+        Flux<ServerSentEvent<TransactionResponse>> body = webTestClient.get()
+            .uri("/api/stream/transactions?accountNumber=001-0001")
+            .accept(MediaType.TEXT_EVENT_STREAM)
+            .exchange()
+            .expectStatus().isOk()
+            .returnResult(SSE_TYPE)
+            .getResponseBody()
+            .onErrorResume(error -> Flux.empty());
+
+        // Un error con la respuesta ya comprometida por heartbeats debe cerrar la conexión
+        StepVerifier.create(body)
+            .expectNextMatches(event -> "heartbeat".equals(event.comment()))
+            .thenConsumeWhile(event -> "heartbeat".equals(event.comment()))
+            .expectComplete()
+            .verify(Duration.ofSeconds(5));
+    }
+
+    @Test
+    void streamTransactionsWithoutAccountDelegatesWithNull() {
+        when(transactionService.transmitirTransacciones(null)).thenReturn(Flux.empty());
+
+        Flux<ServerSentEvent<TransactionResponse>> body = webTestClient.get()
+            .uri("/api/stream/transactions")
+            .accept(MediaType.TEXT_EVENT_STREAM)
+            .exchange()
+            .expectStatus().isOk()
+            .returnResult(SSE_TYPE)
             .getResponseBody();
 
         StepVerifier.create(body).verifyComplete();
-        verify(transactionService, never()).getTransactionsByAccount(any());
+        verify(transactionService).transmitirTransacciones(null);
+    }
+
+    @Test
+    void correlationIdHeaderIsEchoedInResponse() {
+        webTestClient.get()
+            .uri("/api/health")
+            .header("X-Correlation-Id", "corr-echo")
+            .exchange()
+            .expectHeader().valueEquals("X-Correlation-Id", "corr-echo");
+    }
+
+    @Test
+    void correlationIdIsGeneratedAndReturnedWhenMissing() {
+        when(transactionService.procesarTransaccion(any(TransactionRequest.class)))
+            .thenReturn(Mono.error(new AccountNotFoundException()));
+
+        WebTestClient.BodyContentSpec body = postTransaction(VALID_REQUEST, null)
+            .expectHeader().exists("X-Correlation-Id")
+            .expectBody();
+        String header = body.returnResult().getResponseHeaders().getFirst("X-Correlation-Id");
+        body.jsonPath("$.correlationId").isEqualTo(header);
     }
 
     @Test
@@ -182,10 +292,10 @@ class TransactionControllerTest {
             .expectBody(String.class).isEqualTo("{\"status\":\"UP\"}");
     }
 
-    private void assertBusinessError(String serviceMessage, int expectedStatus,
+    private void assertBusinessError(Throwable serviceError, int expectedStatus,
                                      String expectedCode, String expectedMessage) {
-        when(transactionService.processTransaction(any(TransactionRequest.class)))
-            .thenReturn(Mono.error(new RuntimeException(serviceMessage)));
+        when(transactionService.procesarTransaccion(any(TransactionRequest.class)))
+            .thenReturn(Mono.error(serviceError));
 
         postTransaction(VALID_REQUEST, "corr-err")
             .expectStatus().isEqualTo(expectedStatus)

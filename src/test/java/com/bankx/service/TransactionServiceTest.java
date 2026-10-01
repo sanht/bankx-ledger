@@ -2,7 +2,12 @@ package com.bankx.service;
 
 import com.bankx.domain.Account;
 import com.bankx.domain.Transaction;
+import com.bankx.dto.RiskDecision;
 import com.bankx.dto.TransactionRequest;
+import com.bankx.dto.TransactionResponse;
+import com.bankx.exception.AccountNotFoundException;
+import com.bankx.exception.InsufficientFundsException;
+import com.bankx.exception.RiskRejectedException;
 import com.bankx.repository.AccountRepository;
 import com.bankx.repository.TransactionRepository;
 import org.junit.jupiter.api.BeforeEach;
@@ -16,6 +21,7 @@ import reactor.test.StepVerifier;
 import reactor.util.context.Context;
 
 import java.math.BigDecimal;
+import java.time.Duration;
 import java.time.LocalDateTime;
 
 import static org.mockito.ArgumentMatchers.any;
@@ -33,11 +39,15 @@ public class TransactionServiceTest {
     @Mock
     private RiskService riskService;
 
+    private TransactionEventPublisher eventPublisher;
+
     private TransactionService transactionService;
 
     @BeforeEach
     void setUp() {
-        transactionService = new TransactionService(accountRepository, transactionRepository, riskService);
+        eventPublisher = new TransactionEventPublisher();
+        transactionService = new TransactionService(accountRepository, transactionRepository, riskService,
+            eventPublisher);
     }
 
     @Test
@@ -62,7 +72,7 @@ public class TransactionServiceTest {
             .amount(debitAmount)
             .build();
 
-        RiskService.RiskDecision riskOk = RiskService.RiskDecision.builder()
+        RiskDecision riskOk = RiskDecision.builder()
             .decision("OK")
             .fallback(false)
             .build();
@@ -70,7 +80,7 @@ public class TransactionServiceTest {
         when(accountRepository.findByAccountNumber(accountNumber))
             .thenReturn(Mono.just(account));
         
-        when(riskService.evaluateRisk(any(), any(), any(), any()))
+        when(riskService.evaluarRiesgo(any(), any(), any(), any()))
             .thenReturn(Mono.just(riskOk));
         
         when(accountRepository.save(any()))
@@ -82,7 +92,7 @@ public class TransactionServiceTest {
             .thenAnswer(invocation -> Mono.just(invocation.getArgument(0)));
 
         // Act & Assert
-        StepVerifier.create(transactionService.processTransaction(request)
+        StepVerifier.create(transactionService.procesarTransaccion(request)
                 .contextWrite(Context.of("correlationId", "test-corr-id")))
             .expectNextMatches(response -> 
                 response.getAccountNumber().equals(accountNumber) &&
@@ -114,7 +124,7 @@ public class TransactionServiceTest {
             .amount(debitAmount)
             .build();
 
-        RiskService.RiskDecision riskOk = RiskService.RiskDecision.builder()
+        RiskDecision riskOk = RiskDecision.builder()
             .decision("OK")
             .fallback(false)
             .build();
@@ -122,15 +132,13 @@ public class TransactionServiceTest {
         when(accountRepository.findByAccountNumber(accountNumber))
             .thenReturn(Mono.just(account));
         
-        when(riskService.evaluateRisk(any(), any(), any(), any()))
+        when(riskService.evaluarRiesgo(any(), any(), any(), any()))
             .thenReturn(Mono.just(riskOk));
 
         // Act & Assert
-        StepVerifier.create(transactionService.processTransaction(request)
+        StepVerifier.create(transactionService.procesarTransaccion(request)
                 .contextWrite(Context.of("correlationId", "test-corr-id")))
-            .expectErrorMatches(error -> 
-                error.getMessage().contains("insufficient_funds")
-            )
+            .expectError(InsufficientFundsException.class)
             .verify();
     }
 
@@ -150,11 +158,9 @@ public class TransactionServiceTest {
             .thenReturn(Mono.empty());
 
         // Act & Assert
-        StepVerifier.create(transactionService.processTransaction(request)
+        StepVerifier.create(transactionService.procesarTransaccion(request)
                 .contextWrite(Context.of("correlationId", "test-corr-id")))
-            .expectErrorMatches(error -> 
-                error.getMessage().contains("account_not_found")
-            )
+            .expectError(AccountNotFoundException.class)
             .verify();
     }
 
@@ -167,15 +173,15 @@ public class TransactionServiceTest {
 
         when(accountRepository.findByAccountNumber(accountNumber))
             .thenReturn(Mono.just(account));
-        when(riskService.evaluateRisk(any(), any(), any(), any()))
-            .thenReturn(Mono.just(RiskService.RiskDecision.builder().decision("OK").fallback(true).build()));
+        when(riskService.evaluarRiesgo(any(), any(), any(), any()))
+            .thenReturn(Mono.just(RiskDecision.builder().decision("OK").fallback(true).build()));
         when(accountRepository.save(any(Account.class)))
             .thenAnswer(invocation -> Mono.just(invocation.getArgument(0)));
         when(transactionRepository.save(any(Transaction.class)))
             .thenAnswer(invocation -> Mono.just(invocation.getArgument(0)));
 
         // Act & Assert
-        StepVerifier.create(transactionService.processTransaction(request)
+        StepVerifier.create(transactionService.procesarTransaccion(request)
                 .contextWrite(Context.of("correlationId", "test-corr-id")))
             .expectNextMatches(response ->
                 response.getType().equals("CREDIT") &&
@@ -192,14 +198,14 @@ public class TransactionServiceTest {
         String accountNumber = "001-0001";
         when(accountRepository.findByAccountNumber(accountNumber))
             .thenReturn(Mono.just(activeAccount(accountNumber, BigDecimal.valueOf(1000))));
-        when(riskService.evaluateRisk(any(), any(), any(), any()))
-            .thenReturn(Mono.just(RiskService.RiskDecision.builder()
+        when(riskService.evaluarRiesgo(any(), any(), any(), any()))
+            .thenReturn(Mono.just(RiskDecision.builder()
                 .decision("REJECTED").reason("Amount exceeds legacy limit").build()));
 
         // Act & Assert
-        StepVerifier.create(transactionService.processTransaction(request(accountNumber, "DEBIT", BigDecimal.TEN))
+        StepVerifier.create(transactionService.procesarTransaccion(request(accountNumber, "DEBIT", BigDecimal.TEN))
                 .contextWrite(Context.of("correlationId", "test-corr-id")))
-            .expectErrorMatches(error -> error.getMessage().equals("risk_rejected"))
+            .expectError(RiskRejectedException.class)
             .verify();
     }
 
@@ -209,35 +215,95 @@ public class TransactionServiceTest {
         String accountNumber = "001-0001";
         when(accountRepository.findByAccountNumber(accountNumber))
             .thenReturn(Mono.just(activeAccount(accountNumber, BigDecimal.valueOf(1000))));
-        when(riskService.evaluateRisk(any(), any(), any(), any()))
+        when(riskService.evaluarRiesgo(any(), any(), any(), any()))
             .thenReturn(Mono.error(new RuntimeException("Legacy service unavailable")));
 
         // Act & Assert
-        StepVerifier.create(transactionService.processTransaction(request(accountNumber, "DEBIT", BigDecimal.TEN))
+        StepVerifier.create(transactionService.procesarTransaccion(request(accountNumber, "DEBIT", BigDecimal.TEN))
                 .contextWrite(Context.of("correlationId", "test-corr-id")))
-            .expectErrorMatches(error -> error.getMessage().equals("risk_rejected"))
+            .expectError(RiskRejectedException.class)
             .verify();
     }
 
     @Test
-    void testGetTransactionsByAccount() {
-        Transaction transaction = Transaction.builder().id("tx-1").accountNumber("001-0001").build();
-        when(transactionRepository.findByAccountNumber("001-0001"))
-            .thenReturn(Flux.just(transaction));
+    void testSuccessfulTransactionIsPublishedToLiveStream() {
+        String accountNumber = "001-0001";
+        when(accountRepository.findByAccountNumber(accountNumber))
+            .thenReturn(Mono.just(activeAccount(accountNumber, BigDecimal.valueOf(1000))));
+        when(riskService.evaluarRiesgo(any(), any(), any(), any()))
+            .thenReturn(Mono.just(RiskDecision.builder().decision("OK").build()));
+        when(accountRepository.save(any(Account.class)))
+            .thenAnswer(invocation -> Mono.just(invocation.getArgument(0)));
+        when(transactionRepository.save(any(Transaction.class)))
+            .thenAnswer(invocation -> Mono.just(invocation.getArgument(0)));
 
-        StepVerifier.create(transactionService.getTransactionsByAccount("001-0001"))
-            .expectNext(transaction)
-            .verifyComplete();
+        StepVerifier.create(eventPublisher.eventos())
+            .then(() -> transactionService.procesarTransaccion(request(accountNumber, "CREDIT", BigDecimal.TEN))
+                .contextWrite(Context.of("correlationId", "live-corr"))
+                .subscribe())
+            .expectNextMatches(event -> "CREDIT".equals(event.getType()) && "live-corr".equals(event.getCorrelationId()))
+            .thenCancel()
+            .verify(Duration.ofSeconds(5));
     }
 
     @Test
-    void testGetTransactionsByAccount_Error() {
+    void testRejectedTransactionIsNotPublished() {
+        String accountNumber = "001-0001";
+        when(accountRepository.findByAccountNumber(accountNumber))
+            .thenReturn(Mono.just(activeAccount(accountNumber, BigDecimal.valueOf(1000))));
+        when(riskService.evaluarRiesgo(any(), any(), any(), any()))
+            .thenReturn(Mono.just(RiskDecision.builder().decision("REJECTED").build()));
+
+        StepVerifier.create(eventPublisher.eventos())
+            .then(() -> transactionService.procesarTransaccion(request(accountNumber, "DEBIT", BigDecimal.TEN))
+                .contextWrite(Context.of("correlationId", "rejected-corr"))
+                .onErrorResume(error -> Mono.empty())
+                .subscribe())
+            .expectNoEvent(Duration.ofMillis(200))
+            .thenCancel()
+            .verify(Duration.ofSeconds(5));
+    }
+
+    @Test
+    void testStreamWithAccountEmitsHistoryThenOnlyLiveEventsOfThatAccount() {
+        Transaction historic = Transaction.builder().id("tx-old").accountNumber("001-0001")
+            .type("DEBIT").amount(BigDecimal.ONE).status("OK").correlationId("old-corr").build();
+        when(transactionRepository.findByAccountNumber("001-0001"))
+            .thenReturn(Flux.just(historic));
+
+        StepVerifier.create(transactionService.transmitirTransacciones("001-0001"))
+            .expectNextMatches(event -> "tx-old".equals(event.getTransactionId())
+                && "old-corr".equals(event.getCorrelationId()))
+            .then(() -> {
+                eventPublisher.publicar(TransactionResponse.builder().transactionId("tx-other").accountNumber("002-0002").build());
+                eventPublisher.publicar(TransactionResponse.builder().transactionId("tx-new").accountNumber("001-0001").build());
+            })
+            .expectNextMatches(event -> "tx-new".equals(event.getTransactionId()))
+            .thenCancel()
+            .verify(Duration.ofSeconds(5));
+    }
+
+    @Test
+    void testStreamWithoutAccountEmitsAllLiveEvents() {
+        StepVerifier.create(transactionService.transmitirTransacciones(null))
+            .then(() -> {
+                eventPublisher.publicar(TransactionResponse.builder().transactionId("tx-a").accountNumber("001-0001").build());
+                eventPublisher.publicar(TransactionResponse.builder().transactionId("tx-b").accountNumber("002-0002").build());
+            })
+            .expectNextMatches(event -> "tx-a".equals(event.getTransactionId()))
+            .expectNextMatches(event -> "tx-b".equals(event.getTransactionId()))
+            .thenCancel()
+            .verify(Duration.ofSeconds(5));
+    }
+
+    @Test
+    void testStreamPropagatesHistoryError() {
         when(transactionRepository.findByAccountNumber("001-0001"))
             .thenReturn(Flux.error(new RuntimeException("mongo down")));
 
-        StepVerifier.create(transactionService.getTransactionsByAccount("001-0001"))
+        StepVerifier.create(transactionService.transmitirTransacciones("001-0001"))
             .expectErrorMessage("mongo down")
-            .verify();
+            .verify(Duration.ofSeconds(5));
     }
 
     private Account activeAccount(String accountNumber, BigDecimal balance) {

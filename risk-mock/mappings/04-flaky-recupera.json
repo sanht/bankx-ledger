@@ -1,0 +1,16 @@
+{
+  "priority": 1,
+  "scenarioName": "flaky",
+  "requiredScenarioState": "Recuperado",
+  "newScenarioState": "Started",
+  "request": {
+    "method": "POST",
+    "url": "/api/risk/evaluate",
+    "bodyPatterns": [{ "matchesJsonPath": { "expression": "$.simulate", "equalTo": "flaky" } }]
+  },
+  "response": {
+    "status": 200,
+    "jsonBody": { "decision": "OK", "reason": "mock: aprobado tras un fallo" },
+    "headers": { "Content-Type": "application/json" }
+  }
+}

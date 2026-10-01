@@ -21,6 +21,18 @@ services:
       timeout: 5s
       retries: 5
 
+  # Mock del servicio de riesgo remoto (WireMock). Respuestas en risk-mock/mappings/,
+  # elegidas por el campo "simulate" del request: fail, timeout, flaky, invalid.
+  risk-mock:
+    image: wiremock/wiremock:3.9.1
+    container_name: bankx-risk-mock
+    ports:
+      - "9090:8080"
+    volumes:
+      - ./risk-mock:/home/wiremock:ro
+    networks:
+      - bankx-network
+
 volumes:
   mongodb_data:
     driver: local

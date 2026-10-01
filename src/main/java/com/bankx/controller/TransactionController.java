@@ -3,13 +3,16 @@ package com.bankx.controller;
 import com.bankx.dto.ErrorResponse;
 import com.bankx.dto.TransactionRequest;
 import com.bankx.dto.TransactionResponse;
+import com.bankx.exception.BusinessException;
+import com.bankx.observability.CorrelationId;
 import com.bankx.service.TransactionService;
 import jakarta.validation.Valid;
 import lombok.extern.slf4j.Slf4j;
-import org.slf4j.MDC;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
+import org.springframework.http.codec.ServerSentEvent;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
@@ -19,19 +22,24 @@ import org.springframework.web.bind.annotation.RestController;
 import org.springframework.web.server.ServerWebExchange;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
-import reactor.util.context.Context;
 
-import java.util.UUID;
+import java.time.Duration;
 
 @Slf4j
 @RestController
 @RequestMapping("/api")
 public class TransactionController {
 
-    private final TransactionService transactionService;
+    private static final String SSE_EVENT = "transaction";
+    private static final String SSE_HEARTBEAT = "heartbeat";
 
-    public TransactionController(TransactionService transactionService) {
+    private final TransactionService transactionService;
+    private final Duration heartbeatInterval;
+
+    public TransactionController(TransactionService transactionService,
+                                 @Value("${bankx.sse.heartbeat-interval:15s}") Duration heartbeatInterval) {
         this.transactionService = transactionService;
+        this.heartbeatInterval = heartbeatInterval;
     }
 
     /**
@@ -39,97 +47,67 @@ public class TransactionController {
      * Crea una transacción.
      */
     @PostMapping(value = "/transactions", produces = MediaType.APPLICATION_JSON_VALUE)
-    public Mono<ResponseEntity<?>> createTransaction(
+    public Mono<ResponseEntity<?>> crearTransaccion(
         @Valid @RequestBody TransactionRequest request,
         ServerWebExchange exchange) {
-        
-        // Extraer o generar X-Correlation-Id
-        String correlationId = exchange.getRequest()
-            .getHeaders()
-            .getFirst("X-Correlation-Id");
-        
-        if (correlationId == null) {
-            correlationId = UUID.randomUUID().toString();
-        }
-        
-        final String corrId = correlationId;
-        MDC.put("correlationId", corrId);
-        
-        return transactionService.processTransaction(request)
+
+        // CorrelationIdFilter ya dejó el correlationId en el exchange y en el contexto de Reactor
+        String correlationId = CorrelationId.from(exchange);
+
+        return transactionService.procesarTransaccion(request)
             .<ResponseEntity<?>>map(ResponseEntity::ok)
-            .onErrorResume(error -> handleError(error, corrId))
-            .contextWrite(Context.of("correlationId", corrId))
-            .doFinally(signal -> MDC.remove("correlationId"));
+            .onErrorResume(error -> manejarError(error, correlationId));
     }
 
     /**
      * GET /api/stream/transactions
-     * Server-Sent Events: stream de transacciones.
+     * Server-Sent Events: historial de la cuenta (opcional) y transacciones en vivo.
+     *
+     * Intercala un comentario ":heartbeat" cada heartbeatInterval para que ingress/APIM no corten
+     * la conexión por inactividad y para detectar clientes caídos al fallar la escritura.
+     * El heartbeat se detiene cuando el stream de transacciones termina o falla.
      */
     @GetMapping(value = "/stream/transactions", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
-    public Flux<TransactionResponse> streamTransactions(
-        @RequestParam(required = false) String accountNumber,
-        ServerWebExchange exchange) {
-        
-        String correlationId = exchange.getRequest()
-            .getHeaders()
-            .getFirst("X-Correlation-Id");
-        
-        if (correlationId == null) {
-            correlationId = UUID.randomUUID().toString();
-        }
-        
-        final String corrId = correlationId;
-        log.info("[{}] Streaming transactions for account: {}", corrId, accountNumber);
-        
-        if (accountNumber != null && !accountNumber.isEmpty()) {
-            return transactionService.getTransactionsByAccount(accountNumber)
-                .map(transaction -> TransactionResponse.builder()
-                    .transactionId(transaction.getId())
-                    .accountNumber(transaction.getAccountNumber())
-                    .type(transaction.getType())
-                    .amount(transaction.getAmount())
-                    .status(transaction.getStatus())
-                    .correlationId(corrId)
-                    .build())
-                .doOnError(error -> {
-                    log.error("[{}] Stream error: {}", corrId, error.getMessage());
-                });
-        }
-        
-        return Flux.empty();
+    public Flux<ServerSentEvent<TransactionResponse>> transmitirTransacciones(
+        @RequestParam(required = false) String accountNumber) {
+
+        log.info("Streaming transactions for account: {}", accountNumber);
+
+        Flux<ServerSentEvent<TransactionResponse>> eventos = transactionService.transmitirTransacciones(accountNumber)
+            .map(transaction -> ServerSentEvent.builder(transaction)
+                .id(transaction.getTransactionId())
+                .event(SSE_EVENT)
+                .build());
+
+        return eventos
+            .publish(compartido -> Flux.merge(compartido, heartbeat().takeUntilOther(compartido.then())))
+            .doOnCancel(() -> log.info("Stream client disconnected"))
+            .doOnError(error -> log.error("Stream error: {}", error.getMessage()));
+    }
+
+    private Flux<ServerSentEvent<TransactionResponse>> heartbeat() {
+        return Flux.interval(heartbeatInterval)
+            .map(tick -> ServerSentEvent.<TransactionResponse>builder().comment(SSE_HEARTBEAT).build());
     }
 
     @GetMapping("/health")
-    public Mono<ResponseEntity<String>> health() {
+    public Mono<ResponseEntity<String>> salud() {
         return Mono.just(ResponseEntity.ok("{\"status\":\"UP\"}"));
     }
 
     /**
      * Maneja errores de negocio.
      */
-    private Mono<ResponseEntity<?>> handleError(Throwable error, String correlationId) {
+    private Mono<ResponseEntity<?>> manejarError(Throwable error, String correlationId) {
         String errorCode = "internal_error";
         HttpStatus status = HttpStatus.INTERNAL_SERVER_ERROR;
         String message = error.getMessage();
 
         log.error("[{}] Transaction error: {}", correlationId, message);
 
-        if ("account_not_found".equals(message)) {
-            errorCode = "account_not_found";
-            status = HttpStatus.UNPROCESSABLE_ENTITY;
-            message = "Account not found";
-        } else if ("insufficient_funds".equals(message)) {
-            errorCode = "insufficient_funds";
-            status = HttpStatus.UNPROCESSABLE_ENTITY;
-            message = "Insufficient funds";
-        } else if ("risk_rejected".equals(message)) {
-            errorCode = "risk_rejected";
-            status = HttpStatus.UNPROCESSABLE_ENTITY;
-            message = "Risk service rejected the transaction";
-        } else if (message != null && message.contains("validation")) {
-            errorCode = "validation_error";
-            status = HttpStatus.BAD_REQUEST;
+        if (error instanceof BusinessException businessError) {
+            errorCode = businessError.getErrorCode();
+            status = businessError.getStatus();
         }
 
         ErrorResponse response = ErrorResponse.of(errorCode, message, correlationId);

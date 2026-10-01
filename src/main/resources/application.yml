@@ -1,6 +1,10 @@
 spring:
   application:
     name: bankx-ledger
+
+  # Propaga el contexto de Reactor (correlationId) a ThreadLocals como el MDC
+  reactor:
+    context-propagation: auto
   
   # MongoDB reactivo
   data:
@@ -33,8 +37,6 @@ logging:
   level:
     root: INFO
     com.bankx: DEBUG
-  pattern:
-    console: "%d{yyyy-MM-dd HH:mm:ss.SSS} [%thread] %-5level %logger{36} - %msg%n"
   logback:
     rollingpolicy:
       max-file-size: 10MB
@@ -44,16 +46,25 @@ management:
   endpoints:
     web:
       exposure:
-        include: health,metrics,info
+        include: health,metrics,info,circuitbreakers,circuitbreakerevents
   endpoint:
     health:
       show-details: always
       probes:
         enabled: true
+  health:
+    # Muestra el estado del circuit breaker en /actuator/health (apagado por defecto en Boot 3)
+    circuitbreakers:
+      enabled: true
   metrics:
     export:
       simple:
         enabled: true
+
+bankx:
+  sse:
+    # Menor que el timeout de inactividad más corto de la cadena (ingress-nginx, APIM)
+    heartbeat-interval: 15s
 
 risk:
   service:
@@ -72,17 +83,18 @@ resilience4j:
         sliding-window-size: 10
         failure-rate-threshold: 50
         wait-duration-in-open-state: 10000
-        permitted-calls-in-half-open-state: 3
+        permitted-number-of-calls-in-half-open-state: 3
         automatic-transition-from-open-to-half-open-enabled: true
+        # Los 4xx no indican que el servicio esté caído: no cuentan para abrir el circuito
+        ignore-exception-predicate: com.bankx.service.RiskClientErrorPredicate
   
   retry:
     instances:
       risk-service:
-        max-attempts: 3
-        wait-duration: 1000
-        retry-exceptions:
-          - java.io.IOException
-          - java.net.ConnectException
+        max-attempts: 3          # 1 intento + 2 reintentos
+        wait-duration: 500ms
+        # Solo errores pasajeros: conexión, 502, 503, 504 (ver la clase)
+        retry-exception-predicate: com.bankx.service.TransientRiskErrorPredicate
   
   timelimiter:
     instances:

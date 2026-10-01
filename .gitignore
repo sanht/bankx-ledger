@@ -38,3 +38,8 @@ logs/
 # OS
 Thumbs.db
 .DS_Store
+
+# Documentación y herramientas de prueba locales (no se suben)
+docs-local/
+scripts/
+postman/

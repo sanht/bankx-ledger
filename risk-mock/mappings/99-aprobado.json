@@ -1,0 +1,12 @@
+{
+  "priority": 10,
+  "request": {
+    "method": "POST",
+    "url": "/api/risk/evaluate"
+  },
+  "response": {
+    "status": 200,
+    "jsonBody": { "decision": "OK", "reason": "mock: riesgo bajo" },
+    "headers": { "Content-Type": "application/json" }
+  }
+}

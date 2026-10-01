@@ -1,0 +1,16 @@
+{
+  "priority": 1,
+  "scenarioName": "flaky",
+  "requiredScenarioState": "Started",
+  "newScenarioState": "Recuperado",
+  "request": {
+    "method": "POST",
+    "url": "/api/risk/evaluate",
+    "bodyPatterns": [{ "matchesJsonPath": { "expression": "$.simulate", "equalTo": "flaky" } }]
+  },
+  "response": {
+    "status": 503,
+    "jsonBody": { "error": "risk_service_unavailable" },
+    "headers": { "Content-Type": "application/json" }
+  }
+}

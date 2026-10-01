@@ -1,0 +1,13 @@
+{
+  "priority": 5,
+  "request": {
+    "method": "POST",
+    "url": "/api/risk/evaluate",
+    "bodyPatterns": [{ "matchesJsonPath": "$[?(@.amount > 10000)]" }]
+  },
+  "response": {
+    "status": 200,
+    "jsonBody": { "decision": "REJECTED", "reason": "mock: monto supera 10000" },
+    "headers": { "Content-Type": "application/json" }
+  }
+}

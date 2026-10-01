@@ -1,0 +1,13 @@
+{
+  "priority": 1,
+  "request": {
+    "method": "POST",
+    "url": "/api/risk/evaluate",
+    "bodyPatterns": [{ "matchesJsonPath": { "expression": "$.simulate", "equalTo": "invalid" } }]
+  },
+  "response": {
+    "status": 400,
+    "jsonBody": { "error": "invalid_risk_request" },
+    "headers": { "Content-Type": "application/json" }
+  }
+}

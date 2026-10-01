@@ -41,6 +41,8 @@ dependencies {
     // Logging
     implementation 'org.springframework.boot:spring-boot-starter-logging'
     implementation 'net.logstash.logback:logstash-logback-encoder:7.4'
+    // Restaura el correlationId del contexto de Reactor en el MDC en cada cambio de hilo
+    implementation 'io.micrometer:context-propagation'
     
     // Actuator (health, metrics)
     implementation 'org.springframework.boot:spring-boot-starter-actuator'

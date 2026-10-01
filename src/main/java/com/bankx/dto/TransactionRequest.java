@@ -2,6 +2,7 @@ package com.bankx.dto;
 
 import jakarta.validation.constraints.NotBlank;
 import jakarta.validation.constraints.NotNull;
+import jakarta.validation.constraints.Pattern;
 import jakarta.validation.constraints.Positive;
 import lombok.AllArgsConstructor;
 import lombok.Builder;
@@ -19,7 +20,8 @@ public class TransactionRequest {
     private String accountNumber;
 
     @NotNull(message = "type cannot be null")
-    private String type; // DEBIT, CREDIT
+    @Pattern(regexp = "DEBIT|CREDIT", message = "type must be DEBIT or CREDIT")
+    private String type;
 
     @NotNull(message = "amount cannot be null")
     @Positive(message = "amount must be positive")
