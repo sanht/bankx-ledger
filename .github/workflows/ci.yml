@@ -27,3 +27,23 @@ jobs:
       - name: Build + tests + checkstyle + cobertura
         run: ./gradlew check
 
+  docker:
+    name: Build and Push Docker Image
+    needs: build
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Login to ghcr.io
+        run: echo ${{ secrets.GITHUB_TOKEN }} | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+
+      - name: Build Docker image
+        run: docker build -t ghcr.io/sanht/bankx-ledger:${{ github.sha }} .
+
+      - name: Push Docker image
+        run: docker push ghcr.io/sanht/bankx-ledger:${{ github.sha }}
