@@ -7,3 +7,13 @@ build
 k8s
 *.md
 docker-compose.yml
+docs-local/
+scripts/
+postman/
+risk-mock/
+mongo-init.js
+config/
+gradlew.bat
+.gitignore
+Dockerfile
+.dockerignore

@@ -1,25 +1,24 @@
-# ---------- Etapa 1: build ----------
-FROM eclipse-temurin:17-jdk AS build
+# ETAPA 1: BUILD - Compilar el código
+FROM eclipse-temurin:17-jdk-jammy AS build
 WORKDIR /workspace
 
-# Primero solo lo necesario para resolver dependencias (mejor caché de capas)
-COPY gradlew settings.gradle build.gradle lombok.config ./
-COPY gradle gradle
-RUN chmod +x gradlew && ./gradlew dependencies --no-daemon -q > /dev/null
+# Copiar archivos que Gradle necesita
+COPY build.gradle settings.gradle gradlew lombok.config ./
+COPY gradle/ ./gradle/
+COPY src/ ./src/
 
-# Código fuente y empaquetado (los tests se ejecutan en el pipeline de CI)
-COPY config config
-COPY src src
-RUN ./gradlew bootJar --no-daemon -q
+# Compilar con Gradle
+RUN ./gradlew bootJar --no-daemon
 
-# ---------- Etapa 2: runtime ----------
-FROM eclipse-temurin:17-jre
+# ETAPA 2: RUNTIME - Solo ejecutar la app
+FROM eclipse-temurin:17-jre-jammy
 WORKDIR /app
 
-RUN groupadd --system app && useradd --system --gid app app
+# Copiar el jar desde la etapa build
 COPY --from=build /workspace/build/libs/*.jar app.jar
-USER app
 
+# Puerto en el que escucha la app
 EXPOSE 8080
-ENV JAVA_OPTS="-XX:MaxRAMPercentage=75.0"
-ENTRYPOINT ["sh", "-c", "exec java $JAVA_OPTS -jar /app/app.jar"]
+ 
+# Comando de arranque
+ENTRYPOINT ["java", "-jar", "app.jar"]

@@ -2,74 +2,28 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [ "main" ]
   pull_request:
-    branches: [main]
+    branches: [ "main" ]
 
 jobs:
-  build-test:
-    name: Build, tests y calidad
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
+  build:
 
-      - name: Set up JDK 17
-        uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: '17'
-
-      - name: Set up Gradle (con caché)
-        uses: gradle/actions/setup-gradle@v4
-
-      - name: Build + tests + checkstyle + cobertura
-        run: ./gradlew build --no-daemon
-
-      - name: Publicar reportes (tests, cobertura, checkstyle)
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: reports
-          path: |
-            build/reports/tests/test
-            build/reports/jacoco/test
-            build/reports/checkstyle
-
-  docker:
-    name: Imagen Docker
-    needs: build-test
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      packages: write
+
     steps:
       - uses: actions/checkout@v4
-
-      - uses: docker/setup-buildx-action@v3
-
-      - name: Login a GitHub Container Registry
-        if: github.event_name == 'push'
-        uses: docker/login-action@v3
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
         with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          java-version: '17'
+          distribution: 'temurin'
 
-      - name: Tags de la imagen (sha + latest)
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ghcr.io/${{ github.repository_owner }}/bankx-ledger
-          tags: |
-            type=sha,format=long
-            type=raw,value=latest,enable={{is_default_branch}}
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@af1da67850ed9a4cedd57bfd976089dd991e2582 # v4.0.0
 
-      - name: Build (y push solo en main)
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          push: ${{ github.event_name == 'push' }}
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+      - name: Build + tests + checkstyle + cobertura
+        run: ./gradlew check
+
